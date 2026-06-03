@@ -1,73 +1,353 @@
-# ContextCleaner-MCP
+# ContextCleaner-MCP v2.0 — Selective Pruning
 
-**ContextCleaner-MCP** is an intelligent context management layer designed for AI agents and LLM-based applications. It solves the problem of "Context Window Exhaustion" by allowing the agent to autonomously monitor its token usage and perform **Semantic Pruning**.
+**ContextCleaner-MCP** — сервер контекст-менеджмента по протоколу MCP (Model Context Protocol), реализующий **селективное удаление** (selective pruning) сообщений из сессии.
 
-Unlike simple history truncation, ContextCleaner-MCP enables the agent to compress previous interactions into a high-density **Summary Checkpoint**, preserving critical state while clearing out verbose logs, tool outputs, and redundant reasoning.
+В отличие от наивного truncation ("оставить последние N сообщений"), этот сервер позволяет агенту **помечать конкретные сообщения как неактуальные** и удалять только их, сохраняя критически важный контекст.
 
-## Features
+## Проблема
 
-- 📊 **Context Statistics**: Real-time monitoring of session history size and estimated token counts.
-- ✂️ **Semantic Pruning**: Truncates session logs while preserving the initial system instructions and the most recent N messages.
-- 💾 **State Checkpointing**: Injects a high-level summary of the session's progress directly into the truncated history, ensuring the agent retains all critical knowledge.
-- 🤖 **Autonomous Management**: Designed to be used by the agent itself through a standardized tool-calling interface.
+В длинных сессиях агент генерирует массу промежуточных данных:
+- Большие выводы инструментов (tool outputs): JSON, CSV, HTML, логи
+- Промежуточные рассуждения (reasoning), ставшие неактуальными
+- Дублирующиеся запросы
 
-## Quick Start for Agents
+Простое обрезание "последних N сообщений" рискует потерять:
+- Начальные системные инструкции
+- Важные уточнения пользователя из середины диалога
+- Ключевые решения агента
 
-If you are an AI agent, follow these instructions to install and use this tool.
+## Решение: Selective Pruning
 
-### 1. Installation
-To install this extension, use your environment's extension manager or point to the manifest file:
-
-```bash
-# Example for a CLI supporting MCP extensions
-[extension-manager] install ./path/to/ContextCleaner-MCP
-```
-
-### 2. Configuration
-Ensure your `gemini-extension.json` (or equivalent manifest) points to the correct entry point:
+Агент (или клиент) помечает сообщения специальным флагом в `metadata`:
 
 ```json
 {
-  "name": "context-cleaner",
-  "mcpServers": {
-    "cleaner-server": {
-      "command": "python3",
-      "args": ["src/server.py"]
-    }
+  "id": "tool-001",
+  "role": "tool",
+  "type": "tool_output",
+  "content": "... massive JSON output ...",
+  "metadata": {
+    "prune": true,
+    "prune_reason": "intermediate data",
+    "pruned_at": "2026-05-26T12:00:00Z"
   }
 }
 ```
 
-### 3. Usage Pattern
-You should trigger the pruning process when your context window reaches 70-80% capacity.
+MCP сервер находит все помеченные сообщения и безопасно удаляет их:
+- Создаёт бэкап перед изменением
+- Использует atomic write (запись во временный файл + rename)
+- Возвращает статистику экономии токенов
 
-**Step 1: Check Stats**
-```python
-get_context_stats()
-```
-
-**Step 2: Perform Pruning**
-Generate a concise summary of your current progress and call:
-```python
-prune_history(
-    keep_last_n=3, 
-    summary_checkpoint="Goal: [Task]. Progress: [A, B]. Key Findings: [X]. Next: [Y]."
-)
-```
-
-## Tool Definitions
+## Инструменты
 
 ### `get_context_stats()`
-- **Input**: None
-- **Output**: JSON object with `file_size_bytes`, `total_lines`, and `estimated_tokens`.
+Возвращает статистику сессии, включая количество помеченных сообщений и потенциальную экономию токенов.
 
-### `prune_history(keep_last_n, summary_checkpoint)`
-- **`keep_last_n`** (int): Number of most recent messages to preserve for flow continuity.
-- **`summary_checkpoint`** (string): A mandatory semantic summary to replace the removed history.
+```json
+{
+  "file_path": "...",
+  "total_messages": 14,
+  "total_tokens": 1623,
+  "marked_for_pruning": 8,
+  "marked_tokens": 969,
+  "potential_savings_percent": 59.7
+}
+```
 
-## Architecture
+### `mark_for_pruning(criteria)`
+Помечает сообщения для удаления по критериям:
+- `ids`: массив ID сообщений
+- `types`: массив типов (`tool_output`, `reasoning`, ...)
+- `roles`: массив ролей (`tool`, `assistant`, ...)
+- `content_pattern`: подстрока для поиска в content
+- `reason`: причина маркировки (сохраняется в metadata)
 
-ContextCleaner-MCP operates as a standalone MCP server. It interacts directly with the session's persistence layer (JSONL logs) to safely remove intermediate noise while maintaining structural integrity.
+```json
+{
+  "ids": ["tool-001", "tool-002"],
+  "types": ["tool_output", "reasoning"],
+  "reason": "heavy intermediate data"
+}
+```
 
-## License
+### `prune_marked()`
+Удаляет все сообщения с `metadata.prune = true`.
+Автоматически создаёт бэкап `.backup`.
+
+Возвращает детальную статистику:
+```json
+{
+  "status": "success",
+  "pruned_count": 8,
+  "tokens_saved": 969,
+  "savings_percent": 59.7,
+  "backup_created": true
+}
+```
+
+### `restore_backup()`
+Восстанавливает сессию из последнего бэкапа.
+
+### `list_messages(show_pruned_only)`
+Возвращает список сообщений с их статусом prune и оценкой токенов.
+
+## Быстрый старт
+
+```bash
+# Указать директорию с .jsonl сессиями
+export SESSION_DIR="./tmp/chats"
+
+# Запустить сервер
+python src/server.py
+```
+
+Сервер читает запросы из stdin и пишет ответы в stdout в формате JSON-RPC 2.0.
+
+## Пример сценария использования
+
+**Сессия: анализ CSV + визуализация**
+
+| ID | Тип | Содержание | Решение |
+|----|-----|-----------|---------|
+| `sys-001` | system | Инструкции | ✅ Оставить |
+| `user-001` | user | Запрос | ✅ Оставить |
+| `think-001` | reasoning | Промежуточная мысль | ❌ Пометить |
+| `tool-001` | tool_output | `head` CSV (50000 строк) | ❌ Пометить |
+| `think-002` | reasoning | Промежуточная мысль | ❌ Пометить |
+| `tool-002` | tool_output | `describe()` вывод | ❌ Пометить |
+| `assistant-001` | final | Финальный скрипт + объяснение | ✅ Оставить |
+| `user-002` | user | Уточнение | ✅ Оставить |
+| `think-004` | reasoning | Промежуточная мысль | ❌ Пометить |
+| `tool-004` | tool_output | Корреляционная матрица | ❌ Пометить |
+| `assistant-002` | final | Итоговый ответ | ✅ Оставить |
+
+**Результат:**
+- До prune: 14 сообщений, 1623 токена
+- После prune: 6 сообщений, 654 токена
+- **Экономия: 969 токенов (59.7%)**
+- Все критические сообщения сохранены
+
+## Сравнение с truncation: реальный кейс (HTML-шахматы)
+
+Сессия разработки интерактивных шахмат в HTML содержала 18 сообщений с тяжёлыми tool outputs (документация, логи, base64-скриншоты), reasoning steps и двумя версиями финального кода.
+
+### Что оставляет truncation (v1.0, keep_last_n=5)
+
+| Оставлено | Удалено | Проблема |
+|-----------|---------|----------|
+| system prompt | ✅ | — |
+| checkpoint summary | ✅ | Генеричная фраза без деталей |
+| user-003 (добавь подсветку) | ❌ | Агент не знает исходного запроса |
+| **think-005** (reasoning) | ❌ | **Мусор сохранён** |
+| **tool-005** (base64 image) | ❌ | **Мусор сохранён** |
+| assistant-003 (patch) | ❌ | Полный код v1 потерян |
+| user-004 (perfect!) | ❌ | — |
+
+**Результат:** агент видит только patch "добавь подсветку", но:
+- Не знает, что вообще создавал (нет `user-001`)
+- Не имеет полного кода (потерян `assistant-002`)
+- Тратит токены на бессмысленный reasoning и base64-изображение
+
+### Что оставляет selective pruning
+
+| Оставлено | Удалено |
+|-----------|---------|
+| system prompt | ✅ |
+| user-001, user-002, user-003, user-004 | ✅ Все требования |
+| assistant-002 (полный код v1) | ✅ |
+| assistant-003 (patch v2) | ✅ |
+
+**Мусор удалён полностью:** 11 сообщений (reasoning, tool outputs, intermediate code)
+
+### Итоговое сравнение
+
+| Метрика | Selective | Truncation |
+|---------|-----------|------------|
+| Сообщений осталось | 7 | 7 |
+| Экономия токенов | **79%** (2512 токенов) | 58% (1848 токенов) |
+| Критические сообщения сохранены | **7/7** | 4/7 |
+| Мусор остался | **0** | 2 (reasoning + base64) |
+| Агент может продолжить работу | **✅ Да** | ❌ Нет |
+
+## Безопасность
+
+- **Бэкапы:** Перед любой модификацией создаётся `.backup`
+- **Atomic write:** Запись во временный файл + `shutil.move`
+- **Валидация JSON:** Повреждённые строки не ломают сессию
+- **Идемпотентность:** Повторный `prune_marked` безопасен (нет помеченных → no-op)
+
+## Архитектура
+
+```
+┌─────────────┐     stdin/stdout      ┌─────────────────────┐
+│  MCP Client │  ◄────────────────►   │  ContextCleaner-MCP │
+│  (Agent/IDE)│      JSON-RPC 2.0     │     src/server.py   │
+└─────────────┘                       └─────────────────────┘
+                                              │
+                                              ▼
+                                       ┌──────────────┐
+                                       │  SessionManager│
+                                       │  - read/write  │
+                                       │  - mark/prune  │
+                                       │  - backup      │
+                                       └──────────────┘
+                                              │
+                                              ▼
+                                       ┌──────────────┐
+                                       │ *.jsonl файл │
+                                       │  сессии      │
+                                       └──────────────┘
+```
+
+## Тестирование
+
+```bash
+# Базовые тесты selective pruning
+python test_selective_prune.py
+
+# Сравнительный тест: selective vs truncation (шахматы)
+python test_chess_comparison.py
+
+# Сравнение с обычной работой LLM (тетрис)
+python test_tetris_comparison.py
+
+# Реальный агент с автоочисткой (без Kimi CLI)
+python agent_client.py
+
+# Реальные тесты через Kimi CLI:
+# cd test-chess-without-mcp && kimi --print --prompt "..."
+# cd test-chess-with-mcp && kimi --print --prompt "..."
+```
+
+Тесты проверяют:
+1. Маркировку по типам и ID
+2. Подсчёт токенов и экономии
+3. Удаление только помеченных сообщений
+4. Сохранение критических сообщений
+5. Корректность бэкапа и восстановления
+6. **Сравнение качества контекста** selective pruning vs truncation
+
+## Пример 2: разработка Тетриса (сравнение с обычной работой LLM)
+
+Сессия разработки полноценного Тетриса: 26 сообщений, 5 итераций, Canvas API, Web Audio, анимации.
+
+### RAW (обычная работа без очистки)
+- **26 сообщений, 4240 токенов**
+- Качество: 100% (всё на месте)
+- Проблема: 71% токенов — мусор (reasoning, tool outputs, intermediate code)
+- При длинной сессии контекст переполняется, каждый запрос дороже
+
+### Selective Pruning
+- **10 сообщений, 1228 токенов**
+- Экономия: **71% токенов (3012)**
+- Качество: **100%** — все требования и все версии кода сохранены
+- Мусора: **0**
+
+### Truncation (keep_last_n=5)
+- **7 сообщений, 914 токенов**
+- Качество: **40%** — потеряны исходные требования и финальный код v1
+- Мусора: **2** (reasoning + Web Audio тест)
+- Агент не может добавить новую фигуру или touch-управление
+
+### Способность к модификации
+
+| Задача | RAW | Selective | Truncation |
+|--------|-----|-----------|------------|
+| Добавить фигуру | ✅ | ✅ | ❌ |
+| Изменить цвета | ✅ | ✅ | ❌ |
+| Touch-управление | ✅ | ✅ | ❌ |
+| Убрать музыку | ✅ | ✅ | ✅ |
+| Изменить скорость | ✅ | ✅ | ❌ |
+
+### Экономическая выгода
+При 100 запросов в длинной сессии: **301,200 токенов сэкономлено** (~$0.90)
+При масштабировании на тысячи запросов: экономия становится существенной.
+
+## Пример 3: разработка шахмат через Kimi CLI (реальные тесты)
+
+Проведено прямое сравнение двух подходов с использованием настоящего Kimi Code CLI.
+
+### Без MCP (обычная работа)
+
+```bash
+cd test-chess-without-mcp
+kimi --print --prompt "Create a chess board in HTML..."
+kimi --print --prompt "Update chess.html to add interactivity..."
+```
+
+**Результат:**
+- `chess.html`: **8202 байт** (полноценные интерактивные шахматы)
+- Сессия: **9 сообщений, 345 токенов**
+- Весь мусор сохранён: reasoning, tool outputs, intermediate code
+
+### С MCP (автоочистка)
+
+```bash
+cd test-chess-with-mcp
+kimi --print --prompt "Create a chess board... After finishing, use context-cleaner MCP to clean up intermediate steps."
+```
+
+**Результат:**
+- `chess.html`: **6049 байт** (базовая + интерактивная версия)
+- Сессия после prune: **4 сообщения, 72 токена**
+- **Экономия: 79% токенов (273 из 345)**
+
+### Сравнение контекста
+
+| Параметр | БЕЗ MCP | С MCP |
+|----------|---------|-------|
+| Сообщений в контексте | 9 | 4 |
+| Токенов | 345 | **72** |
+| Мусора (reasoning/tool) | 5 | **0** |
+| Старые версии кода | Сохранены | **Удалены** |
+| Бэкап | Нет | ✅ Да |
+
+### Что осталось после очистки MCP
+
+| ID | Тип | Статус |
+|----|-----|--------|
+| user-001 | user | ✅ Сохранён |
+| user-002 | user | ✅ Сохранён |
+| assistant-002 | final | ✅ Сохранён |
+
+### Что было удалено
+
+| ID | Тип | Причина |
+|----|-----|---------|
+| think-001 | reasoning | Промежуточная мысль |
+| tool-001 | tool_output | Вывод валидатора |
+| assistant-001 | intermediate | Устаревшая версия кода v1 |
+| think-002 | reasoning | Промежуточная мысль |
+| tool-002 | tool_output | Вывод линтера |
+
+### Как это работает в Kimi CLI
+
+1. MCP сервер настроен в `~/.kimi/mcp.json`
+2. При запуске `kimi` автоматически подключается к `context-cleaner`
+3. Kimi видит 5 инструментов и может вызывать их по имени
+4. После генерации кода Kimi вызывает `mark_for_pruning` + `prune_marked`
+5. Контекст очищается автоматически
+
+### Подтверждение подключения
+
+```bash
+$ kimi mcp list
+  context-cleaner (stdio): python server.py
+```
+
+```bash
+$ kimi mcp test context-cleaner
+  Testing connection to 'context-cleaner'...
+  ✓ Connected successfully
+  Tools: get_context_stats, mark_for_pruning, prune_marked, restore_backup, list_messages
+```
+
+## Требования
+
+- Python 3.10+
+- Нет внешних зависимостей (только stdlib)
+
+## Лицензия
+
 MIT
