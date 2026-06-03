@@ -4,6 +4,8 @@
 
 ---
 
+<a name="english"></a>
+
 ## English
 
 **ContextCleaner-MCP** is a context-management server for the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) that implements **selective pruning** of session messages.
@@ -358,6 +360,8 @@ MIT
 ---
 
 <a name="русский"></a>
+
+[English](#english) | **Русский**
 
 ## Русский
 
