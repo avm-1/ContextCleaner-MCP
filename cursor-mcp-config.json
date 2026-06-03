@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "context-cleaner": {
+      "command": "python3",
+      "args": ["${workspaceFolder}/src/server.py"],
+      "env": {
+        "SESSION_DIR": "${workspaceFolder}/sessions"
+      }
+    }
+  }
+}
